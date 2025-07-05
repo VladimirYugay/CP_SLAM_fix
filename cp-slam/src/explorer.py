@@ -15,6 +15,9 @@ from src.pose_graph import  Pose_graph
 from tqdm import trange
 from copy import deepcopy
 from torch.utils.tensorboard import SummaryWriter
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module='torch')
+import time
 
 class Explorer():
     '''
@@ -69,6 +72,9 @@ class Explorer():
         else:
             dataset = SelfmakeDataset(self.cfg, self.device)
             dataloader = DataLoader(dataset)
+        import sys
+        print("loaded explorer dataset of size: ", len(dataloader))
+        sys.stdout.flush()
         return dataloader
 
     def add_total_map(self, frame):
@@ -135,6 +141,7 @@ class Explorer():
         last_frame_pose = None
         init = True
         last_depth_map = None
+        tracking_times, mapping_times = [], []
         for iter, data in tqdm(enumerate(self.dataloader)):
             frame = Frame(self.cfg, torch.tensor(data['color_img'].squeeze(),device=self.device, dtype=torch.float32), 
                         torch.tensor(data['depth_img'].squeeze(), device=self.device, dtype=torch.float32)/self.cfg['camera']['png_depth_scale'])
@@ -143,7 +150,7 @@ class Explorer():
             frame.near, frame.far = depth_min, depth_max
             gt_pose = data['pose'].squeeze()
             self.gt_pose_list.append(gt_pose)
-
+            print("Agent: ", self.agent_id, "Frame: ", frame.id)
             if init:
                 # Initial frame starts from the gt pose for convenient evaluation
                 frame.pose = gt_pose.detach()
@@ -178,19 +185,25 @@ class Explorer():
                 # Initial map optimization (Initialization) and viz (viz is optional)
                 frame.uv = uv
                 self.map_frame_list.append(frame)
+
+                start = time.time()
                 self.feature_map = self.optimizer.optimize_map(frame, self.total_map, self.feature_map, self.camera_rgbd, self.cfg['map_init_iters'])
+                mapping_times.append(time.time() - start)
+
                 self.update_share_data(share_data)
                 init = False
                 self.optimizer.net_to_eval()
                 depth_viz, color_viz = self.optimizer.render_whole_image(frame, self.camera_rgbd, self.total_map, self.feature_map, self.device)
                 self.optimizer.net_to_train()
-                cv2.imwrite(self.cfg['viz_path'] + 'render_depth_{:05}.png'.format(frame.id), depth_viz)
-                cv2.imwrite(self.cfg['viz_path'] + 'render_color_{:05}.jpg'.format(frame.id), color_viz)
+                # cv2.imwrite(self.cfg['viz_path'] + 'render_depth_{:05}.png'.format(frame.id), depth_viz)
+                # cv2.imwrite(self.cfg['viz_path'] + 'render_color_{:05}.jpg'.format(frame.id), color_viz)
                 continue
             
             # Pose optimization
+            start = time.time()
             last_frame_pose, self.delta_pose_list, self.est_pose_list =  self.optimizer.optimize_pose(frame, last_frame_pose, self.total_map, self.feature_map, 
                                                                             self.delta_pose_list, self.est_pose_list, gt_pose, self.camera_rgbd, loop_mode=False, viz = writer, agent_name = self.name)                
+            tracking_times.append(time.time() - start)
 
             # Bundle adjustment signal (since 4 keyframes)
             enable_BA = (len(self.keyframe_list) > 4) and self.cfg['BA']
@@ -213,7 +226,11 @@ class Explorer():
                     self.inherit_mlp(share_data)
                     batch_frame_list_loop = [frame] 
                     # Current frame refine for subsequent exploration
+            
+                    start = time.time()
                     self.feature_map = self.optimizer.optimize_map_batch(batch_frame_list_loop, self.total_map, self.feature_map, self.camera_rgbd, iteration = self.cfg['loop_refine_iters'], MLP_update=False)
+                    mapping_times.append(time.time() - start)
+
                     share_data.fusion = False
                     fed_strategy.value = True
                 points_3d_world, feature_new , self.occupy_list, uv =  self.add_total_map(frame)
@@ -230,6 +247,8 @@ class Explorer():
                 # Joint mapping regarding co-visible frames
                 frame.uv = uv
                 self.map_frame_list.append(frame)
+
+                start = time.time()
                 if enable_BA:
                     select_idxes = keyframe_selection_overlap(self.cfg['camera']['H'], self.cfg['camera']['W'], self.camera_rgbd.intrinsics, self.cfg['mask_scale'], 
                                                                         frame, frame.pose, self.keyframe_list[:-1], 3, self.device)
@@ -239,13 +258,14 @@ class Explorer():
                     if len(self.keyframe_list)>0:
                         batch_frame_list = self.keyframe_list + [frame]
                 self.feature_map = self.optimizer.optimize_map_batch(batch_frame_list, self.total_map, self.feature_map, self.camera_rgbd, iteration=self.cfg['map_iters'], MLP_update=True)
+                mapping_times.append(time.time() - start)
                 
                 # viz (optional viz)
                 if iter % self.cfg['viz_fre'] == 0:
                     viz_frame = deepcopy(frame)
                     depth_viz, color_viz = self.optimizer.viz(viz_frame, self.camera_rgbd, self.total_map, self.feature_map, self.device)
-                    cv2.imwrite(self.cfg['viz_path'] + 'render_depth_{:05}.png'.format(frame.id), depth_viz)
-                    cv2.imwrite(self.cfg['viz_path'] + 'render_color_{:05}.jpg'.format(frame.id), color_viz)
+                    # cv2.imwrite(self.cfg['viz_path'] + 'render_depth_{:05}.png'.format(frame.id), depth_viz)
+                    # cv2.imwrite(self.cfg['viz_path'] + 'render_color_{:05}.jpg'.format(frame.id), color_viz)
                 
                 self.update_share_data(share_data)
 
@@ -272,7 +292,41 @@ class Explorer():
                 # Indicate whether the local agent has completed its exploration
                 fed_strategy.value = False
                 share_data.est_poses_tensor =  deepcopy(torch.stack(self.est_pose_list, dim = 0).detach()).cpu()
-                share_data.gt_poses_tensor = deepcopy(torch.stack(self.gt_pose_list, dim = 0).detach()).cpu()
+                share_data.gt_poses_tensor = deepcopy(torch.stack(self.gt_pose_list, dim = 0).detach()).cpu() 
+
+                from pathlib import Path
+                Path(self.cfg['viz_path']).mkdir(parents=True, exist_ok=True)
+
+                torch.save(self.total_map, self.cfg['viz_path'] + 'total_map.pt')
+                torch.save(self.feature_map, self.cfg['viz_path'] + 'feature_map.pt')
+                self.optimizer.save(self.cfg['viz_path'] + 'optimizer.pkl')
+
+                for i in range(len(self.map_frame_list)):
+                    self.map_frame_list[i].pose = self.est_pose_list[self.map_frame_list[i].id].detach()
+                
+                import pickle
+                with open(self.cfg['viz_path'] + 'frames.pkl', 'wb') as f:
+                    pickle.dump(self.map_frame_list, f)
+                
+                av_mapping_time = sum(mapping_times) / len(mapping_times)
+                av_tracking_time = sum(tracking_times) / len(tracking_times)
+                with open(self.cfg['viz_path'] + 'time.txt', 'w') as f:
+                    f.write('total mapping time: ' + str(sum(mapping_times)) + '\n')
+                    f.write('total mapping steps: ' + str(len(mapping_times)) + '\n')
+                    f.write('average mapping time: ' + str(av_mapping_time) + '\n')
+
+                    f.write('total tracking time: ' + str(sum(tracking_times)) + '\n')
+                    f.write('total tracking steps: ' + str(len(tracking_times)) + '\n')
+                    f.write('average tracking time: ' + str(av_tracking_time) + '\n')
+                
+                with open(self.cfg['viz_path'] + 'occupy_list.pkl', 'wb') as f:
+                    pickle.dump(self.occupy_list, f)
+
+                # for frame in self.map_frame_list:
+                #     a, b = self.optimizer.viz(frame, self.camera_rgbd, self.total_map, self.feature_map, self.device)
+                #     cv2.imwrite(self.cfg['viz_path'] + 'render_depth_{:05}.png'.format(frame.id), a)
+                #     cv2.imwrite(self.cfg['viz_path'] + 'render_color_{:05}.jpg'.format(frame.id), b)
+
                 end_signal.value = True 
 
                     

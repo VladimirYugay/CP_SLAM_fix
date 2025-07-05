@@ -13,6 +13,7 @@ from utils.utils import CalPoseError
 from data.dataloader import *
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+import time
 
 
 class Fusion():
@@ -105,7 +106,7 @@ class Fusion():
 
         total_map_fusion = torch.cat([share_data_one.total_map.to(device), pc_stick], dim=0)
         feature_map_fusion = torch.cat([share_data_one.feature_map.to(device), feature_stick], dim=0)
-        source_table_fusion = torch.cat([share_data_one.source_table, source_table_stick], dim=0)
+        source_table_fusion = torch.cat([share_data_one.source_table.to(device), source_table_stick.to(device)], dim=0)
 
         return total_map_fusion, feature_map_fusion, new_occupy_list, source_table_fusion
     
@@ -181,7 +182,7 @@ class Fusion():
         for name in ['agent_one', 'agent_two']:
             dataloader = self.dataloader_choice(self.configer_group[name])
             if name == 'agent_one':
-                for iter, data in enumerate(tqdm(dataloader)):
+                for iter, data in enumerate(dataloader):
                     if iter in  map_frame_one:
                         depth_img = torch.tensor(data['depth_img'].squeeze(), device=self.device, dtype=torch.float32)/self.configer_group[name]['camera']['png_depth_scale']
                         uv = source_table_one[source_table_one[:,2]==iter, :2].to(self.device)
@@ -201,11 +202,11 @@ class Fusion():
                      
                         recon_total_map = torch.cat([recon_total_map, points_3d_world], 0) 
                         recon_feature_map = torch.cat([recon_feature_map, sub_feature], 0)
-                        recon_source_table = torch.cat([recon_source_table, sub_source_table], 0)
+                        recon_source_table = torch.cat([recon_source_table.to(self.device), sub_source_table], 0)
                     else: 
                         continue
             if name == 'agent_two':
-                for iter, data in enumerate(tqdm(dataloader)):
+                for iter, data in enumerate(dataloader):
                     if iter in  map_frame_two:
                         depth_img = torch.tensor(data['depth_img'].squeeze(), device=self.device, dtype=torch.float32)/self.configer_group[name]['camera']['png_depth_scale']
                         uv = source_table_two[source_table_two[:,2]==iter, :2].to(self.device)
@@ -225,9 +226,14 @@ class Fusion():
 
                         recon_total_map = torch.cat([recon_total_map, points_3d_world], 0) 
                         recon_feature_map = torch.cat([recon_feature_map, sub_feature], 0)
-                        recon_source_table = torch.cat([recon_source_table, sub_source_table], 0)
+                        recon_source_table = torch.cat([recon_source_table.to(self.device), sub_source_table], 0)
                     else: 
                         continue
+
+        
+
+
+
         return recon_total_map, recon_feature_map, recon_source_table
 
     def multi_fusion(self, lock_des, lock_map_one, lock_map_two, share_data_one, share_data_two, end_signal_one, end_signal_two):
@@ -238,6 +244,7 @@ class Fusion():
         self.pose_graph.posegraph_optimizer = PoseGraphOptimization() 
         fusion_signal = False
         loop_signal = True
+        times = []
         while(1):
             # Loop closure detection by comparing different descriptor pools
             lock_des.acquire()
@@ -260,15 +267,23 @@ class Fusion():
                 self.frame_to_device(loop_frame_two, self.device)
                 self.copy_net(share_data_one, self.device)
 
-                # Calculate the loop relative pose and align sub-maps and sub-trajs 
+                # Calculate the loop relative pose and align sub-maps and sub-trajs
+                start = time.time()
                 feature_map_loop = self.optimizer.optimize_map(loop_frame_one, share_data_one.total_map.to(self.device), share_data_one.feature_map.to(self.device), self.camera_rgbd, 300)
-                
+                times.append(time.time() - start)
+
+                start = time.time()
                 loop_pose = self.optimizer.optimize_pose(loop_frame_two, loop_frame_one.pose, 
                                                                             share_data_one.total_map.to(self.device), feature_map_loop, 
                                                                             None, None ,None, self.camera_rgbd, loop_mode = True)
+                times.append(time.time() - start)
+
                 print('loop_pose:{}, loop_fram_one_pose:{}'.format(loop_pose, loop_frame_one.pose))
                 delta_pose_one, delta_pose_two = self.traj_stick(loop_pose, loop_frame_one, loop_frame_two, self.device )
+
+                start = time.time()
                 total_map_fusion, feature_map_fusion, occupy_list_fusion, source_table_fusion = self.map_stick(loop_pose, loop_frame_two, share_data_one, share_data_two, self.device)
+                times.append(time.time() - start)
                 
                 # MLPs' weight averaging and copy
                 w_avg = self.mlp_avg(share_data_one, share_data_two)
@@ -291,18 +306,20 @@ class Fusion():
                     keyframe_list_two.append(keyframe)
 
                 # Retrain
+                start = time.time()
                 i_train = np.array([i for i in np.arange(int(len(share_data_one.keyframe_list_val + keyframe_list_two)))])
-                for _ in range(len(i_train)*100):
+                for _ in tqdm(range(len(i_train)*100)):
                     select_id = np.random.choice(i_train)
                     gb_frame = (share_data_one.keyframe_list_val + keyframe_list_two)[select_id]
                     self.frame_to_device(gb_frame, self.device)
                     feature_map_fusion = self.optimizer.optimize_map(gb_frame, total_map_fusion, feature_map_fusion, self.camera_rgbd, 1)
+                times.append(time.time() - start)
 
                 # Send global sharing MLPs' weights back to local agents
                 share_data_one.total_map_fusion = deepcopy(total_map_fusion.detach()).cpu()
                 share_data_one.feature_map_fusion = deepcopy(feature_map_fusion.detach()).cpu()
                 share_data_one.occupy_list_fusion = deepcopy(occupy_list_fusion)
-                share_data_one.source_table_fusion = deepcopy(source_table_fusion)
+                share_data_one.source_table_fusion = deepcopy(source_table_fusion.detach().cpu())
                 share_data_one.fusion = True
                 share_data_one.delta_pose = deepcopy(delta_pose_one).cpu()
                 share_data_one.loop_id = deepcopy(idx_in_one).cpu()
@@ -312,7 +329,7 @@ class Fusion():
                 
                 share_data_two.total_map_fusion = deepcopy(total_map_fusion.detach()).cpu()
                 share_data_two.feature_map_fusion = deepcopy(feature_map_fusion.detach()).cpu()
-                share_data_two.source_table_fusion = deepcopy(source_table_fusion)
+                share_data_two.source_table_fusion = deepcopy(source_table_fusion.detach().cpu())
                 share_data_two.occupy_list_fusion = deepcopy(occupy_list_fusion)
                 share_data_two.fusion = True
                 share_data_two.delta_pose = deepcopy(delta_pose_two).cpu()
@@ -337,6 +354,7 @@ class Fusion():
         constraints_couples, socres = self.get_loop_constraints(share_data_one.des_db, share_data_two.des_db, self.device)
         constraints_couples = constraints_couples.tolist()
         
+        print("Constructing pose graph")
         # add vertex for agent_one
         for id, pose in enumerate(one_poses_list): 
             if id==0:
@@ -361,6 +379,7 @@ class Fusion():
         self.optimizer.render_optimizer = self.optimizer.create_net_optimizer()
         self.optimizer.render_scheduler = self.optimizer.create_scheduler(self.optimizer.render_optimizer)
 
+        print("Addding loop edges")
         # add loop edges in the global pose graph
         for loop_couple in constraints_couples:
             if loop_couple in self.outliers:
@@ -372,25 +391,34 @@ class Fusion():
             self.frame_to_device(loop_frame_one, self.device)
             self.frame_to_device(loop_frame_two, self.device)
             
+            start = time.time()
             feature_map_loop = self.optimizer.optimize_map(loop_frame_one, share_data_one.total_map.to(self.device), share_data_one.feature_map.to(self.device), self.camera_rgbd, 300)
-                
+
             loop_pose = self.optimizer.optimize_pose(loop_frame_two, loop_frame_one.pose, 
                                                                         share_data_one.total_map.to(self.device), feature_map_loop, 
                                                                         None, None ,None, self.camera_rgbd, loop_mode = True, iter_mode=True)
+            times.append(time.time() - start)
+
             loop_measurement = (np.linalg.inv(loop_pose.detach().cpu().numpy())@loop_frame_one.pose.detach().cpu().numpy())
             loop_measurement_gt = (np.linalg.inv(gt_poses_two[loop_couple[1]*50].detach().cpu().numpy())@gt_poses_one[loop_couple[0]*50].detach().cpu().numpy())
             e_t, e_R = CalPoseError(loop_measurement, loop_measurement_gt)
             print('\033[1;34m Agent one\'s {}th keyframe and Agent two\'s {}th keyframe\033[0m\net:{}, er:{}'.format(loop_couple[0],loop_couple[1], e_t, e_R))
             self.pose_graph.add_single_edge(loop_measurement, loop_couple[0]*50, loop_couple[1]*50+len(one_poses_list))
         
+        print("Optimize the pose graph")
+        start = time.time()
         self.pose_graph.optimization()
         total_est_poses = self.pose_graph.update_pose()
-       
-        one_poses_list = total_est_poses[:2500]
-        two_poses_list = total_est_poses[2500:]
+        times.append(time.time() - start)
+
+        n = len(total_est_poses)
+        one_poses_list = total_est_poses[:n // 2]
+        two_poses_list = total_est_poses[n // 2:]
         
         one_poses_numpy = np.stack(one_poses_list, axis=0)
         one_poses_tensor = torch.from_numpy(one_poses_numpy)
+        from pathlib import Path
+        Path(self.cfg["output_pgo_traj"]).mkdir(parents=True, exist_ok=True)
         torch.save(one_poses_tensor, self.cfg['output_pgo_traj'] + 'pgo_traj_1.pt')
 
         two_poses_numpy = np.stack(two_poses_list, axis=0)
@@ -405,7 +433,7 @@ class Fusion():
 
         global_total_map = torch.cat([share_data_one.total_map.to(self.device), pc_stick], dim=0) 
         global_feature_map = torch.cat([share_data_one.feature_map.to(self.device), feature_stick], dim=0) 
-        global_source_table = torch.cat([share_data_one.source_table, source_table_stick], dim=0) 
+        global_source_table = torch.cat([share_data_one.source_table.to(self.device), source_table_stick.to(self.device)], dim=0) 
         
         total_map_one = global_total_map[(global_source_table[:, -1] == 0), :]
         total_map_two = global_total_map[(global_source_table[:, -1] == 1.), :]
@@ -426,7 +454,16 @@ class Fusion():
         map_frame_two = torch.unique(source_table_two[:,2:3].squeeze().type(torch.int64)).tolist()
 
         #Refine neural point cloud based on the keyframe-centric model
+        start = time.time()
         recon_total_map, recon_feature_map, recon_source_table = self.re_scatter(map_frame_one, source_table_one, feature_map_one, one_poses_list, map_frame_two, source_table_two, feature_map_two, two_poses_list)
-        torch.save(recon_total_map, self.cfg['output_pgo_traj'] + 'pgo_map.pt')
+        times.append(time.time() - start)
+
+        print("Storing", self.cfg['output_pgo_traj'] + 'total_map.pt')
+        torch.save(recon_total_map, self.cfg['output_pgo_traj'] + 'total_map.pt')
+        torch.save(recon_feature_map, self.cfg['output_pgo_traj'] + 'feature_map.pt')
+        self.optimizer.save(self.cfg['output_pgo_traj'] + 'optimizer.pkl')
+
+        with open(self.cfg['output_pgo_traj'] + 'times.txt', 'w') as f:
+            f.write(f"Fusion time: {sum(times)}\n")
 
         print('Complete Exploration!!!')

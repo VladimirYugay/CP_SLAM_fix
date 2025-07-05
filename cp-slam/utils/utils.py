@@ -336,9 +336,14 @@ def select_points(new_added_points, vox_res, occupt_list, new_feature, uv, devic
         uv_filter = uv[inv_idx_filter]
     else:
         uv_filter = None
-        
+
     if source_table!=None:
-        source_table = source_table[inv_idx_filter]
+        source_table = source_table.to(device)
+        n = inv_idx_filter.shape[0]
+        if n < source_table.shape[0]:
+            source_table = source_table
+        else:
+            source_table = source_table[inv_idx_filter]
         
     inv_idx_new = inv_idx[inv_idx_filter]
     

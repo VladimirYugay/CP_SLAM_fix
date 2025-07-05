@@ -8,6 +8,7 @@ from tqdm import trange
 from tqdm import tqdm
 from src.map import samples_generation_pdf
 from torch.utils.tensorboard import SummaryWriter
+import pickle
 
 mse2psnr = lambda x : -10. * torch.log(x) / torch.log(torch.Tensor([10.]))
 to8b = lambda x : (255*np.clip(x,0,1)).astype(np.uint8)
@@ -32,6 +33,42 @@ class Optimizer():
         self.render_scheduler = self.create_scheduler(self.render_optimizer)
         self.coords = torch.stack(torch.meshgrid(torch.linspace(0, cfg['camera']['H']-1, cfg['camera']['H']), torch.linspace(0, cfg['camera']['W']-1, cfg['camera']['W'])), -1)
 
+
+    def save(self, path):
+        # Save model states
+        state = {
+            'cfg': self.cfg,
+            'f_net_state_dict': self.f_net.state_dict(),
+            'density_net_state_dict': self.density_net.state_dict(),
+            'radiance_net_state_dict': self.radiance_net.state_dict(),
+            'f_net_radiance_state_dict': self.f_net_radiance.state_dict(),
+            'render_optimizer_state_dict': self.render_optimizer.state_dict(),
+            'render_scheduler_state_dict': self.render_scheduler.state_dict(),
+        }
+        
+        with open(path, 'wb') as f:
+            pickle.dump(state, f)
+
+    def load(self, path):
+        # Load model states
+        with open(path, 'rb') as f:
+            state = pickle.load(f)
+        
+        self.cfg = state['cfg']
+        self.f_net.load_state_dict(state['f_net_state_dict'])
+        self.density_net.load_state_dict(state['density_net_state_dict'])
+        self.radiance_net.load_state_dict(state['radiance_net_state_dict'])
+        self.f_net_radiance.load_state_dict(state['f_net_radiance_state_dict'])
+        self.render_optimizer.load_state_dict(state['render_optimizer_state_dict'])
+        self.render_scheduler.load_state_dict(state['render_scheduler_state_dict'])
+
+    def to_device(self, device):
+        # Ensure models and other tensors are moved to the correct device after loading
+        self.device = device
+        self.f_net = self.f_net.to(device)
+        self.density_net = self.density_net.to(device)
+        self.radiance_net = self.radiance_net.to(device)
+        self.f_net_radiance = self.f_net_radiance.to(device)
         
     def net_to_train(self):
         '''
@@ -99,7 +136,7 @@ class Optimizer():
             
             if iter%100==0: # verbose freq
                 average = sum(loss_item)/len(loss_item)
-                print(mse2psnr(average.cpu()))
+                # print(mse2psnr(average.cpu()))
                 loss_item = []
 
             loss.backward()        
@@ -150,6 +187,8 @@ class Optimizer():
             pose_optimizer.step()
         if loop_mode:
             return get_camera_from_tensor(candidate_cam_tensor, self.device)
+        if candidate_cam_tensor == None:
+            candidate_cam_tensor = camera_tensor.clone().detach()
         frame.pose = get_camera_from_tensor(candidate_cam_tensor, self.device)
         delta_pose_list.append((np.linalg.inv(frame.pose.detach().cpu().numpy())@last_frame_pose.detach().cpu().numpy()))
         est_pose_list.append(frame.pose.detach())
@@ -157,7 +196,7 @@ class Optimizer():
         if viz != None:
             viz.add_scalar(agent_name + 'Traj/translation', e_t, frame.id)
             viz.add_scalar(agent_name + 'Traj/rotation', e_R, frame.id)
-        print('et:{}, er:{}'.format(e_t, e_R))
+        # print('et:{}, er:{}'.format(e_t, e_R))
         last_frame_pose = frame.pose.detach()
         return last_frame_pose, delta_pose_list, est_pose_list
     
@@ -170,7 +209,7 @@ class Optimizer():
         feature_map = Variable(feature_map.detach(), requires_grad = True) 
         feature_optimizer = self.create_feature_optimizer([feature_map])
         scheduler_cosine_feature = self.create_scheduler(feature_optimizer)
-        for iter in tqdm(range(iteration)):
+        for iter in range(iteration):
             batch_rays_d_list = []
             batch_samples_list = []
             batch_zvals_list = []
@@ -208,7 +247,7 @@ class Optimizer():
 
             if iter%100==0: 
                 average = sum(loss_item)/len(loss_item)
-                print(mse2psnr(average.cpu()))
+                # print(mse2psnr(average.cpu()))
                 loss_item = []
                 
             loss.backward()
@@ -265,7 +304,7 @@ class Optimizer():
             render_img.append(prediction_rgb[None, ...])
         render_depth = torch.cat(render_depth, dim=0)
         render_img = torch.cat(render_img, dim=0)
-        render_img = to8b(render_img.cpu().numpy())        
-        render_depth = todepth(render_depth.cpu().numpy(), self.cfg['camera']['png_depth_scale'])
+        # render_img = to8b(render_img.cpu().numpy())        
+        # render_depth = todepth(render_depth.cpu().numpy(), self.cfg['camera']['png_depth_scale'])
         del frame
         return render_depth, render_img

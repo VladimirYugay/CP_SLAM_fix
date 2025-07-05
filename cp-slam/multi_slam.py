@@ -12,6 +12,8 @@ import torch
 from src.fusion import Fusion
 from src.FedAVG import FedAVG
 from ctypes import c_bool
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module='torch')
 
 class Explorer_single():
     '''
@@ -63,21 +65,24 @@ class Explorer_single():
         p_fed.join()
 
 if __name__ == '__main__':
-    assert os.path.exists('configs/replica.yaml'), 'Cannot find config files!!!'
+    assert os.path.exists('configs/multi_config/multi_0_0.yaml'), 'Cannot find config files!!!'
 
-    with open('configs/replica.yaml', 'r') as f:
+    conf_path = 'configs/multi_config/multi_0_0.yaml'
+    conf1_path = 'configs/multi_config/multi_0_0.yaml'
+    conf2_path = 'configs/multi_config/multi_0_1.yaml'
+
+    with open(conf_path, 'r') as f:
         configer = yaml.safe_load(f)
         print('\033[1;32m Load configer successfully \033[0m')
 
-    with open('configs/multi_config/multi_0_0.yaml', 'r') as f:
+    with open(conf1_path, 'r') as f:
         configer_0 = yaml.safe_load(f)
         print('\033[1;32m Load configer successfully \033[0m')
 
-    with open('configs/multi_config/multi_0_1.yaml', 'r') as f:
+    with open(conf2_path, 'r') as f:
         configer_1 = yaml.safe_load(f)
         print('\033[1;32m Load configer successfully \033[0m')
  
-
     conf = {
     'checkpoint_path': './checkpoint/TokyoTM_struct.mat',
     'whiten': True
